@@ -128,7 +128,25 @@ func (svc *Service) RequestModifier(next proxy.RequestModifyFunc) proxy.RequestM
 				return
 			}
 
+			// If the body was already consumed upstream (e.g. by a previous
+			// modifier), try to recover it via GetBody.
+			if len(body) == 0 && req.GetBody != nil {
+				if rc, err := req.GetBody(); err == nil {
+					body, err = ioutil.ReadAll(rc)
+					rc.Close()
+
+					if err != nil {
+						svc.logger.Errorw("Failed to re-read request body for logging.",
+							"error", err)
+						return
+					}
+				}
+			}
+
 			req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+			req.GetBody = func() (io.ReadCloser, error) {
+				return ioutil.NopCloser(bytes.NewReader(body)), nil
+			}
 			clone.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 		}
 

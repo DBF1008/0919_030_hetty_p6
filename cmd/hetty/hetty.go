@@ -178,6 +178,9 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 	senderService := sender.NewService(sender.Config{
 		Repository:    boltDB,
 		ReqLogService: reqLogService,
+		Retry: sender.RetryConfig{
+			MaxAttempts: 3,
+		},
 	})
 
 	projService, err := proj.NewService(proj.Config{
