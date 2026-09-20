@@ -122,13 +122,18 @@ func (svc *Service) RequestModifier(next proxy.RequestModifyFunc) proxy.RequestM
 			var err error
 
 			body, err = ioutil.ReadAll(req.Body)
+
+			// Always restore the request body (even partially, on read
+			// errors) so downstream handlers and clones don't see a
+			// consumed, empty body.
+			req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+
 			if err != nil {
 				svc.logger.Errorw("Failed to read request body for logging.",
 					"error", err)
 				return
 			}
 
-			req.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 			clone.Body = ioutil.NopCloser(bytes.NewBuffer(body))
 		}
 
@@ -207,11 +212,16 @@ func (svc *Service) ResponseModifier(next proxy.ResponseModifyFunc) proxy.Respon
 		if res.Body != nil {
 			// TODO: Use io.LimitReader.
 			body, err := io.ReadAll(res.Body)
+
+			// Always restore the response body (even partially, on read
+			// errors) so downstream handlers don't see a consumed, empty
+			// body.
+			res.Body = io.NopCloser(bytes.NewBuffer(body))
+
 			if err != nil {
 				return fmt.Errorf("reqlog: could not read response body: %w", err)
 			}
 
-			res.Body = io.NopCloser(bytes.NewBuffer(body))
 			clone.Body = io.NopCloser(bytes.NewBuffer(body))
 		}
 

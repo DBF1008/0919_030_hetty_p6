@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 
 	"github.com/chromedp/chromedp"
@@ -176,8 +177,9 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 	})
 
 	senderService := sender.NewService(sender.Config{
-		Repository:    boltDB,
-		ReqLogService: reqLogService,
+		Repository:           boltDB,
+		ReqLogService:        reqLogService,
+		PendingResponseStore: newPendingResponseStore(cmd, dbPath),
 	})
 
 	projService, err := proj.NewService(proj.Config{
@@ -299,4 +301,18 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 	}
 
 	return nil
+}
+
+// newPendingResponseStore creates a file based pending response store next to
+// the database file, so sender responses that couldn't be written to the
+// database survive restarts and can be flushed later.
+func newPendingResponseStore(cmd *HettyCommand, dbPath string) sender.PendingResponseStore {
+	dir := filepath.Join(filepath.Dir(dbPath), "sender_pending_responses")
+
+	store, err := sender.NewFilePendingResponseStore(dir)
+	if err != nil {
+		cmd.config.logger.Fatal("Failed to create sender pending response store.", zap.Error(err))
+	}
+
+	return store
 }

@@ -2,6 +2,7 @@ package reqlog_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"math/rand"
 	"net/http"
@@ -83,6 +84,90 @@ func TestRequestModifier(t *testing.T) {
 			t.Fatalf("request log not equal (-exp, +got):\n%v", diff)
 		}
 	})
+}
+
+// partialFailReader returns `data` on the first read, then fails with
+// `errInjected` on subsequent reads.
+type partialFailReader struct {
+	data []byte
+	done bool
+}
+
+var errInjected = errors.New("injected read error")
+
+func (r *partialFailReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, errInjected
+	}
+
+	r.done = true
+
+	return copy(p, r.data), nil
+}
+
+func (r *partialFailReader) Close() error { return nil }
+
+//nolint:paralleltest
+func TestRequestModifierRestoresBodyOnReadError(t *testing.T) {
+	svc := reqlog.NewService(reqlog.Config{
+		Scope: &scope.Scope{},
+	})
+	svc.SetActiveProjectID(ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy))
+
+	next := func(req *http.Request) {}
+	reqModFn := svc.RequestModifier(next)
+
+	req := httptest.NewRequest("POST", "https://example.com/", nil)
+	req.Body = &partialFailReader{data: []byte("partial body")}
+	reqID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
+	req = req.WithContext(proxy.WithRequestID(req.Context(), reqID))
+
+	reqModFn(req)
+
+	// Even though reading the body failed, the request body must be restored
+	// (with the partially read content) instead of being left consumed.
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read restored request body: %v", err)
+	}
+
+	if exp := "partial body"; string(body) != exp {
+		t.Fatalf("incorrect restored body (expected: %v, got: %v)", exp, string(body))
+	}
+}
+
+//nolint:paralleltest
+func TestResponseModifierRestoresBodyOnReadError(t *testing.T) {
+	svc := reqlog.NewService(reqlog.Config{})
+	svc.SetActiveProjectID(ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy))
+
+	next := func(res *http.Response) error { return nil }
+	resModFn := svc.ResponseModifier(next)
+
+	req := httptest.NewRequest("GET", "https://example.com/", nil)
+	reqLogID := ulid.MustNew(ulid.Timestamp(time.Now()), ulidEntropy)
+	req = req.WithContext(context.WithValue(req.Context(), reqlog.ReqLogIDKey, reqLogID))
+
+	res := &http.Response{
+		Request: req,
+		Body:    &partialFailReader{data: []byte("partial body")},
+	}
+
+	if err := resModFn(res); err == nil {
+		t.Fatal("expected error (expected: non-nil, got: nil)")
+	}
+
+	// Even though reading the body failed, the response body must be
+	// restored (with the partially read content) instead of being left
+	// consumed.
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("failed to read restored response body: %v", err)
+	}
+
+	if exp := "partial body"; string(body) != exp {
+		t.Fatalf("incorrect restored body (expected: %v, got: %v)", exp, string(body))
+	}
 }
 
 //nolint:paralleltest

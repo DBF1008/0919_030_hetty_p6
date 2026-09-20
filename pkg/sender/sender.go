@@ -20,9 +20,10 @@ import (
 //nolint:gosec
 var ulidEntropy = rand.New(rand.NewSource(time.Now().UnixNano()))
 
+// Note: the client has no `Timeout` of its own; request timeouts are
+// enforced per attempt via `RetryConfig.PerAttemptTimeout`.
 var defaultHTTPClient = &http.Client{
 	Transport: &HTTPTransport{},
-	Timeout:   30 * time.Second,
 }
 
 var (
@@ -37,6 +38,8 @@ type Service struct {
 	repo            Repository
 	reqLogSvc       *reqlog.Service
 	httpClient      *http.Client
+	retryConfig     RetryConfig
+	pendingStore    PendingResponseStore
 }
 
 type FindRequestsFilter struct {
@@ -50,6 +53,12 @@ type Config struct {
 	Repository    Repository
 	ReqLogService *reqlog.Service
 	HTTPClient    *http.Client
+	// Retry controls retry behavior and per-attempt timeouts for outgoing
+	// requests. If nil, `DefaultRetryConfig` is used.
+	Retry *RetryConfig
+	// PendingResponseStore persists responses that couldn't be written to
+	// the repository, so response data isn't lost on repository failures.
+	PendingResponseStore PendingResponseStore
 }
 
 type SendError struct {
@@ -58,14 +67,20 @@ type SendError struct {
 
 func NewService(cfg Config) *Service {
 	svc := &Service{
-		repo:       cfg.Repository,
-		reqLogSvc:  cfg.ReqLogService,
-		httpClient: defaultHTTPClient,
-		scope:      cfg.Scope,
+		repo:         cfg.Repository,
+		reqLogSvc:    cfg.ReqLogService,
+		httpClient:   defaultHTTPClient,
+		scope:        cfg.Scope,
+		retryConfig:  DefaultRetryConfig(),
+		pendingStore: cfg.PendingResponseStore,
 	}
 
 	if cfg.HTTPClient != nil {
 		svc.httpClient = cfg.HTTPClient
+	}
+
+	if cfg.Retry != nil {
+		svc.retryConfig = *cfg.Retry
 	}
 
 	return svc
@@ -146,8 +161,8 @@ func (svc *Service) CloneFromRequestLog(ctx context.Context, reqLogID ulid.ULID)
 		Method:             reqLog.Method,
 		URL:                reqLog.URL,
 		Proto:              HTTPProto20, // Attempt HTTP/2.
-		Header:             reqLog.Header,
-		Body:               reqLog.Body,
+		Header:             reqLog.Header.Clone(),
+		Body:               append([]byte(nil), reqLog.Body...),
 	}
 
 	err = svc.repo.StoreSenderRequest(ctx, req)
@@ -177,7 +192,7 @@ func (svc *Service) SendRequest(ctx context.Context, id ulid.ULID) (Request, err
 		return Request{}, fmt.Errorf("sender: failed to parse HTTP request: %w", err)
 	}
 
-	resLog, err := svc.sendHTTPRequest(httpReq)
+	resLog, err := svc.sendHTTPRequest(ctx, httpReq)
 	if err != nil {
 		return Request{}, fmt.Errorf("sender: could not send HTTP request: %w", err)
 	}
@@ -186,12 +201,53 @@ func (svc *Service) SendRequest(ctx context.Context, id ulid.ULID) (Request, err
 
 	err = svc.repo.StoreSenderRequest(ctx, req)
 	if err != nil {
+		// The response was received but couldn't be stored; persist it to
+		// the pending store (if configured) so the data isn't lost and can
+		// be flushed later via `FlushPendingResponses`.
+		if svc.pendingStore != nil {
+			if storeErr := svc.pendingStore.StorePendingResponse(ctx, req); storeErr != nil {
+				return Request{}, fmt.Errorf("sender: failed to store sender response log: %w "+
+					"(additionally, persisting to pending store failed: %v)", err, storeErr)
+			}
+
+			return req, fmt.Errorf("sender: failed to store sender response log: %w: %v",
+				ErrResponsePersisted, err)
+		}
+
 		return Request{}, fmt.Errorf("sender: failed to store sender response log: %w", err)
 	}
 
-	req.Response = &resLog
-
 	return req, nil
+}
+
+// FlushPendingResponses retries storing requests whose responses were
+// persisted to the pending store after a repository failure. Successfully
+// stored requests are removed from the pending store. It returns the IDs of
+// the requests that are still pending.
+func (svc *Service) FlushPendingResponses(ctx context.Context) ([]ulid.ULID, error) {
+	if svc.pendingStore == nil {
+		return nil, nil
+	}
+
+	pending, err := svc.pendingStore.PendingResponses(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("sender: failed to list pending responses: %w", err)
+	}
+
+	var stillPending []ulid.ULID
+
+	for _, req := range pending {
+		if err := svc.repo.StoreSenderRequest(ctx, req); err != nil {
+			stillPending = append(stillPending, req.ID)
+			continue
+		}
+
+		if err := svc.pendingStore.DeletePendingResponse(ctx, req.ID); err != nil {
+			return stillPending, fmt.Errorf("sender: failed to delete pending response: %w", err)
+		}
+	}
+
+	return stillPending, nil
 }
 
 func parseHTTPRequest(ctx context.Context, req Request) (*http.Request, error) {
@@ -207,21 +263,6 @@ func parseHTTPRequest(ctx context.Context, req Request) (*http.Request, error) {
 	}
 
 	return httpReq, nil
-}
-
-func (svc *Service) sendHTTPRequest(httpReq *http.Request) (reqlog.ResponseLog, error) {
-	res, err := svc.httpClient.Do(httpReq)
-	if err != nil {
-		return reqlog.ResponseLog{}, &SendError{err}
-	}
-	defer res.Body.Close()
-
-	resLog, err := reqlog.ParseHTTPResponse(res)
-	if err != nil {
-		return reqlog.ResponseLog{}, fmt.Errorf("failed to parse http response: %w", err)
-	}
-
-	return resLog, err
 }
 
 func (svc *Service) SetActiveProjectID(id ulid.ULID) {
